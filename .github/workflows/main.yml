@@ -1,0 +1,368 @@
+name: "Secure Temporary RDP Session"
+description: "Creates a secure, temporary Windows RDP environment via Tailscale VPN"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_duration:
+        description: 'Session timeout in minutes (max 240)'
+        default: '240'
+        required: false
+        type: number
+      enable_nla:
+        description: 'Enable Network Level Authentication (recommended)'
+        default: true
+        required: false
+        type: boolean
+      use_exit_node:
+        description: 'Use as Tailscale exit node'
+        default: false
+        required: false
+        type: boolean
+
+jobs:
+  setup-rdp-environment:
+    runs-on: windows-latest
+    timeout-minutes: ${{ github.event.inputs.session_duration || 60 }}
+    
+    env:
+      RDP_USERNAME: "GitHubRDP"
+      RDP_PORT: 3389
+      TAILSCALE_VERSION: "1.82.0" # Default version, will be updated if check fails
+
+    steps:
+      - name: Check Permissions
+        run: |
+          # Verify user has permission to run this workflow
+          Write-Host "Workflow triggered by: $env:GITHUB_ACTOR"
+          Write-Host "Runner: $env:GITHUB_RUN_ID"
+          
+      - name: Get Latest Tailscale Version
+        id: tailscale-version
+        run: |
+          try {
+            $response = Invoke-RestMethod -Uri "https://pkgs.tailscale.com/stable/?format=json" -TimeoutSec 10
+            $version = $response.version
+            Write-Host "Latest Tailscale version: $version"
+            echo "version=$version" >> $env:GITHUB_ENV
+            $env:TAILSCALE_VERSION = $version
+          } catch {
+            Write-Warning "Failed to fetch latest version, using default: $env:TAILSCALE_VERSION"
+          }
+
+      - name: Configure Windows RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Configure NLA based on user input
+          $nlaValue = if ('${{ github.event.inputs.enable_nla }}' -eq 'true') { 1 } else { 0 }
+          Write-Host "Setting NLA to: $nlaValue"
+          
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value $nlaValue -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value $nlaValue -Force
+          
+          # Configure session limits
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "MaxInstanceCount" -Value 2 -Force
+
+      - name: Create Secure Temporary User
+        id: create-user
+        run: |
+          # Generate cryptographically secure password
+          Add-Type -AssemblyName System.Security
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          
+          # 16-character password with complexity requirements
+          $passwordBytes = New-Object byte[] 16
+          $rng.GetBytes($passwordBytes)
+          
+          $base64Password = [Convert]::ToBase64String($passwordBytes)
+          $password = $base64Password -replace '[+/=]', @{'+'='!'; '/'='@'; '='='#'}[$_]
+          $password = $password.Substring(0, [Math]::Min(16, $password.Length))
+          
+          # Ensure complexity
+          $password = $password.Insert(0, [char](Get-Random -Minimum 65 -Maximum 90)) # Upper
+          $password = $password.Insert(1, [char](Get-Random -Minimum 97 -Maximum 122)) # Lower
+          $password = $password.Insert(2, [char](Get-Random -Minimum 48 -Maximum 57)) # Number
+          $password = $password.Insert(3, '!@#$%^&*'[(Get-Random -Minimum 0 -Maximum 7)]) # Special
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          New-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
+            -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
+          
+          # Mask password in logs and set outputs
+          echo "::add-mask::$password"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          echo "user_created=true" >> $env:GITHUB_OUTPUT
+          
+          Write-Host "User '$env:RDP_USERNAME' created successfully"
+          
+          # Set account to expire when workflow ends
+          $expiryDate = (Get-Date).AddMinutes($env:RUNNER_TIMEOUT_MINUTES)
+          $adsi = [ADSI]"WinNT://$env:COMPUTERNAME"
+          $user = $adsi.Children.Find($env:RDP_USERNAME)
+          $user.InvokeSet("AccountExpirationDate", $expiryDate.ToString("yyyyMMddHHmmss.0Z"))
+          $user.SetInfo()
+
+      - name: Install Tailscale VPN
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Write-Host "Downloading Tailscale version: $env:TAILSCALE_VERSION"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UserAgent "GitHubActions"
+          
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "/log", "$env:TEMP\tailscale-install.log" -Wait
+          
+          # Verify installation
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            Write-Host "Tailscale installed successfully"
+          } else {
+            Write-Error "Tailscale installation failed"
+            Get-Content "$env:TEMP\tailscale-install.log" | Select-Object -Last 20
+            exit 1
+          }
+          
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+      - name: Establish Secure VPN Connection
+        id: tailscale
+        run: |
+          # Generate unique hostname
+          $hostname = "gh-rdp-$env:GITHUB_RUN_ID".ToLower()
+          
+          # Build up command
+          $upArgs = @("up")
+          $upArgs += "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}"
+          $upArgs += "--hostname=$hostname"
+          $upArgs += "--accept-routes"
+          
+          if ('${{ github.event.inputs.use_exit_node }}' -eq 'true') {
+            $upArgs += "--advertise-exit-node"
+          }
+          
+          Write-Host "Connecting to Tailscale with hostname: $hostname"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" $upArgs
+          
+          # Wait for IP assignment
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+            if ($tsIP) {
+              break
+            }
+            Write-Host "Waiting for Tailscale IP... ($retries/12)"
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+          
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned after 60 seconds"
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+            exit 1
+          }
+          
+          # Get Tailscale network for firewall rules
+          $tsNetwork = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+          if ($tsNetwork) {
+            $tsNetwork = $tsNetwork.Substring(0, $tsNetwork.LastIndexOf('.') + 1) + "0/24"
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "TAILSCALE_NETWORK=$tsNetwork" >> $env:GITHUB_ENV
+          echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          
+          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Tailscale Network: $tsNetwork"
+
+      - name: Configure Windows Firewall
+        run: |
+          # Remove any existing rule
+          netsh advfirewall firewall delete rule name="GitHub-RDP-Session" 2>$null
+          
+          # Create restrictive firewall rule
+          if ($env:TAILSCALE_NETWORK) {
+            Write-Host "Creating firewall rule for Tailscale network: $env:TAILSCALE_NETWORK"
+            netsh advfirewall firewall add rule name="GitHub-RDP-Session" `
+              dir=in action=allow protocol=TCP localport=$env:RDP_PORT `
+              remoteip=$env:TAILSCALE_NETWORK `
+              description="Temporary RDP access for GitHub session $env:GITHUB_RUN_ID"
+          } else {
+            Write-Host "Creating firewall rule for any IP (Tailscale network not detected)"
+            netsh advfirewall firewall add rule name="GitHub-RDP-Session" `
+              dir=in action=allow protocol=TCP localport=$env:RDP_PORT `
+              description="Temporary RDP access for GitHub session $env:GITHUB_RUN_ID"
+          }
+          
+          # Restart RDP service
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+      - name: Verify Connectivity
+        run: |
+          Write-Host "Testing RDP connectivity on $env:TAILSCALE_IP:$env:RDP_PORT"
+          
+          $maxRetries = 5
+          $retryCount = 0
+          
+          while ($retryCount -lt $maxRetries) {
+            $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $env:RDP_PORT -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+            
+            if ($test.TcpTestSucceeded) {
+              Write-Host "✓ RDP connectivity verified successfully"
+              
+              # Test RDP service status
+              $service = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              if ($service.Status -eq 'Running') {
+                Write-Host "✓ RDP service is running"
+                break
+              } else {
+                Write-Host "✗ RDP service is not running"
+                Restart-Service -Name TermService -Force
+              }
+            } else {
+              Write-Host "✗ Connection attempt $($retryCount + 1)/$maxRetries failed"
+              $retryCount++
+              if ($retryCount -lt $maxRetries) {
+                Start-Sleep -Seconds 10
+              }
+            }
+          }
+          
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "Failed to establish RDP connectivity after $maxRetries attempts"
+            Write-Host "Debug information:"
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+            Get-Service -Name TermService | Format-List
+            exit 1
+          }
+
+      - name: Display Connection Information
+        run: |
+          $border = "=" * 50
+          Write-Host "`n$border"
+          Write-Host "RDP SESSION READY"
+          Write-Host $border
+          Write-Host "Address:    $env:TAILSCALE_IP"
+          Write-Host "Port:       $env:RDP_PORT"
+          Write-Host "Username:   $env:RDP_USERNAME"
+          Write-Host "Password:   **********"
+          Write-Host "Hostname:   $env:TAILSCALE_HOSTNAME"
+          Write-Host $border
+          Write-Host "Session started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "Session timeout: $env:RUNNER_TIMEOUT_MINUTES minutes"
+          Write-Host $border
+          Write-Host "`nTo connect:"
+          Write-Host "1. Ensure you're connected to the same Tailscale network"
+          Write-Host "2. Use mstsc.exe or Remote Desktop Client"
+          Write-Host "3. Enter the address above"
+          Write-Host $border
+          
+          # Calculate expiration time
+          $expiryTime = (Get-Date).AddMinutes($env:RUNNER_TIMEOUT_MINUTES)
+          Write-Host "Session expires at: $($expiryTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+          Write-Host "Time remaining: $env:RUNNER_TIMEOUT_MINUTES minutes"
+          Write-Host $border
+          
+          # Create summary for job output
+          echo "RDP_HOST=$env:TAILSCALE_IP" >> $env:GITHUB_ENV
+          echo "RDP_PORT=$env:RDP_PORT" >> $env:GITHUB_ENV
+          echo "RDP_USER=$env:RDP_USERNAME" >> $env:GITHUB_ENV
+
+      - name: Maintain Session
+        run: |
+          Write-Host "`nMaintaining RDP session. Press 'Cancel' in GitHub to terminate."
+          Write-Host "Session will auto-terminate in $env:RUNNER_TIMEOUT_MINUTES minutes"
+          
+          $startTime = Get-Date
+          $timeoutMinutes = [int]$env:RUNNER_TIMEOUT_MINUTES
+          $checkInterval = 30 # seconds
+          
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            $remainingMinutes = $timeoutMinutes - [math]::Floor($elapsed.TotalMinutes)
+            
+            if ($remainingMinutes -le 0) {
+              Write-Host "Session timeout reached. Exiting."
+              break
+            }
+            
+            # Health check
+            $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            $tailscaleStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+            
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Status: RDP Service: $($rdpService.Status) | Time remaining: ${remainingMinutes}m"
+            
+            if ($rdpService.Status -ne 'Running') {
+              Write-Warning "RDP service not running. Attempting restart..."
+              Start-Service -Name TermService -ErrorAction SilentlyContinue
+            }
+            
+            if ($LASTEXITCODE -ne 0 -or -not $tailscaleStatus) {
+              Write-Warning "Tailscale connection issue detected"
+            }
+            
+            Start-Sleep -Seconds $checkInterval
+          }
+
+  cleanup:
+    needs: [setup-rdp-environment]
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Check if Cleanup Needed
+        id: check-cleanup
+        run: |
+          # Only run cleanup if user was created
+          if ('${{ needs.setup-rdp-environment.outputs.user_created }}' -eq 'true') {
+            echo "cleanup_needed=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Remove RDP User
+        if: steps.check-cleanup.outputs.cleanup_needed == 'true'
+        run: |
+          $user = Get-LocalUser -Name "${{ env.RDP_USERNAME }}" -ErrorAction SilentlyContinue
+          if ($user) {
+            Write-Host "Removing user: ${{ env.RDP_USERNAME }}"
+            Remove-LocalUser -Name "${{ env.RDP_USERNAME }}" -ErrorAction SilentlyContinue
+            Write-Host "User removed successfully"
+          }
+
+      - name: Revert RDP Settings
+        run: |
+          Write-Host "Reverting RDP settings..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 1 -Force
+          
+          # Remove firewall rule
+          netsh advfirewall firewall delete rule name="GitHub-RDP-Session" 2>$null
+          
+          Write-Host "RDP disabled and firewall rule removed"
+
+      - name: Disconnect Tailscale
+        run: |
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            Write-Host "Disconnecting Tailscale..."
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+            Write-Host "Tailscale disconnected"
+          }
+
+      - name: Log Cleanup Completion
+        run: |
+          Write-Host "`n=== CLEANUP COMPLETE ==="
+          Write-Host "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "Session ID: ${{ github.run_id }}"
+          Write-Host "Triggered by: ${{ github.actor }}"
+          Write-Host "=========================`n"
